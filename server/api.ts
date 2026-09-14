@@ -24,10 +24,29 @@ async function getCafeId(): Promise<string> {
 }
 
 // Swagger API Documentation UI & JSON endpoint
-apiRouter.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
+//
+// swagger-ui-express's default setup serves its JS/CSS bundle from the
+// swagger-ui-dist package on disk. That works locally, but on Vercel's
+// serverless functions those static assets aren't included in the bundle,
+// so every request under /docs/* silently falls back to the same index HTML
+// (200 OK, wrong content) instead of the actual JS — which the browser then
+// fails to parse. Loading the bundle from a CDN instead sidesteps the
+// missing-static-files problem entirely.
 apiRouter.get('/docs-json', (req: Request, res: Response) => {
   res.json(swaggerDocument);
 });
+apiRouter.use(
+  '/docs',
+  swaggerUi.serve,
+  swaggerUi.setup(swaggerDocument, {
+    swaggerUrl: '/api/docs-json',
+    customCssUrl: 'https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui.min.css',
+    customJs: [
+      'https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui-bundle.min.js',
+      'https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui-standalone-preset.min.js',
+    ],
+  })
+);
 
 // Health check endpoint for debugging deployment issues
 apiRouter.get('/health', async (_req: Request, res: Response) => {
