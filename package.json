@@ -1,0 +1,28 @@
+{
+  "name": "7-day-s-backend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch server/standalone.ts",
+    "server": "tsx server/standalone.ts",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "nodemailer": "^10.0.9",
+    "pusher": "^5.3.4",
+    "swagger-ui-express": "^5.0.1",
+    "undici": "^8.10.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "@types/swagger-ui-express": "^4.1.8",
+    "@vercel/node": "^3.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2"
+  }
+}
