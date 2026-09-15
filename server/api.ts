@@ -586,11 +586,18 @@ apiRouter.post('/auth/reset-password', async (req: Request, res: Response) => {
 // Kitchen display and Admin dashboard until they mark them done.
 const SERVICE_REQUEST_TYPES = new Set(['water', 'server']);
 
-protectedRouter.get('/service-requests', async (req: Request, res: Response) => {
+// Public: polled by both the customer's own order-tracking screen and the
+// staff Kitchen display, neither of which is guaranteed to be logged in —
+// this was fully public with no auth at all before multi-tenancy, so this
+// keeps that working, just now properly scoped by cafe_id via ?cafeId=
+// instead of implicitly by "whichever cafe is in this database".
+apiRouter.get('/service-requests', async (req: Request, res: Response) => {
   try {
+    const cafeId = String(req.query.cafeId || '');
+    if (!cafeId) return res.status(400).json({ error: 'cafeId is required' });
     const result = await query(
       `SELECT * FROM service_requests WHERE cafe_id = $1 AND status = 'pending' ORDER BY created_at ASC`,
-      [req.cafeId]
+      [cafeId]
     );
     res.json(result.rows.map(mapServiceRequest));
   } catch (err: any) {
@@ -1186,9 +1193,18 @@ protectedRouter.get('/revenue/daily', async (req: Request, res: Response) => {
   }
 });
 
-protectedRouter.get('/orders', async (req: Request, res: Response) => {
+// Public: polled by the customer's own order-tracking screen (to see status
+// updates on their order) as well as staff dashboards — fully public with no
+// auth at all before multi-tenancy, so this keeps that working, just now
+// properly scoped by cafe_id via ?cafeId= instead of implicitly by
+// "whichever cafe is in this database". Exposes other diners' names/phone
+// numbers at the same cafe to anyone who knows its cafeId, same as before
+// this migration — not a new regression, just carried forward as-is.
+apiRouter.get('/orders', async (req: Request, res: Response) => {
   try {
-    const orders = await fetchFullOrders(req.cafeId!);
+    const cafeId = String(req.query.cafeId || '');
+    if (!cafeId) return res.status(400).json({ error: 'cafeId is required' });
+    const orders = await fetchFullOrders(cafeId);
     res.json(orders);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
