@@ -1,27 +1,25 @@
 import express, { Request, Response } from 'express';
+import jwt from 'jsonwebtoken';
 import swaggerUi from 'swagger-ui-express';
 import { query } from './db.js';
 import { swaggerDocument } from './swagger.js';
 import { notifyResourceChanged } from './realtime.js';
 import { hashPassword, verifyPassword, generateResetToken, hashResetToken } from './auth.js';
 import { isMailConfigured, sendPasswordResetEmail } from './mailer.js';
+import { requireAuth } from './authMiddleware.js';
 
 export const apiRouter = express.Router();
 apiRouter.use(express.json());
 
-// Cache the single cafe row's real id so inserts satisfy the cafe_id FK
-// constraint even if the row was seeded/renamed with a different id than
-// any hardcoded value would assume.
-let _cafeId: string | null = null;
-async function getCafeId(): Promise<string> {
-  if (_cafeId) return _cafeId;
-  const result = await query('SELECT id FROM cafes LIMIT 1');
-  if (result.rows.length === 0) {
-    throw new Error('No cafe row found in database — seed the cafes table first');
-  }
-  _cafeId = result.rows[0].id;
-  return _cafeId!;
-}
+// Everything registered on protectedRouter below (menu/table/order
+// management, admin_users, revenue, etc.) requires a staff JWT. The
+// requireAuth+protectedRouter middleware is mounted at the BOTTOM of this
+// file, after every public apiRouter route — Express walks a router's stack
+// in registration order, so requireAuth must not run until the public routes
+// (health, /cafe, /auth/login, /orders, /menu, /categories, /service-requests)
+// have already had a chance to match. Mounting it here at the top would make
+// requireAuth intercept and 401 every request, public ones included.
+const protectedRouter = express.Router();
 
 // Swagger API Documentation UI & JSON endpoint
 //
@@ -168,12 +166,16 @@ function mapMenuItem(row: any) {
 }
 
 // --- CAFE INFO ---
+// Public: the customer menu view (/menu/:cafeId/:tableId) reads this to show
+// the cafe's name/branding/tax rates before any login exists.
 apiRouter.get('/cafe', async (req: Request, res: Response) => {
   try {
-    console.log('[GET /cafe] Fetching cafe info...');
-    const result = await query('SELECT * FROM cafes LIMIT 1');
+    const cafeId = String(req.query.cafeId || '');
+    if (!cafeId) return res.status(400).json({ error: 'cafeId is required' });
+    console.log('[GET /cafe] Fetching cafe info for', cafeId);
+    const result = await query('SELECT * FROM cafes WHERE id = $1', [cafeId]);
     if (result.rows.length === 0) {
-      console.warn('[GET /cafe] No cafe found in database');
+      console.warn('[GET /cafe] No cafe found for id', cafeId);
       return res.status(404).json({ error: 'Cafe not found' });
     }
     const cafe = mapCafe(result.rows[0]);
@@ -181,20 +183,24 @@ apiRouter.get('/cafe', async (req: Request, res: Response) => {
     res.json(cafe);
   } catch (err: any) {
     console.error('[GET /cafe] Error:', err);
-    res.status(500).json({ 
-      error: err.message, 
-      detail: err.detail, 
+    res.status(500).json({
+      error: err.message,
+      detail: err.detail,
       code: err.code,
-      hint: err.hint 
+      hint: err.hint
     });
   }
 });
 
-apiRouter.put('/cafe', async (req: Request, res: Response) => {
+// Protected: cafe settings can only be changed by that cafe's own staff, and
+// always for the cafe their token belongs to — a client-supplied id is
+// never trusted here.
+protectedRouter.put('/cafe', async (req: Request, res: Response) => {
   try {
     const c = req.body;
+    const cafeId = req.cafeId!;
     const result = await query(
-      `UPDATE cafes SET 
+      `UPDATE cafes SET
         name = $1, tagline = $2, logo_url = $3, address = $4, phone = $5,
         currency = $6, tax_percent = $7, service_charge_percent = $8,
         is_accepting_orders = $9, upi_id = $10
@@ -211,10 +217,11 @@ apiRouter.put('/cafe', async (req: Request, res: Response) => {
         c.serviceChargePercent || 0,
         c.isAcceptingOrders ?? true,
         c.upiId || '',
-        c.id || await getCafeId(),
+        cafeId,
       ]
     );
-    notifyResourceChanged('cafe');
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Cafe not found' });
+    notifyResourceChanged(cafeId, 'cafe');
     res.json(mapCafe(result.rows[0]));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -222,54 +229,59 @@ apiRouter.put('/cafe', async (req: Request, res: Response) => {
 });
 
 // --- TABLES ---
+// Public: the QR flow validates/looks up a table by fetching this cafe's
+// table list. Table CRUD itself (create/edit/delete) is staff-only, below.
 apiRouter.get('/tables', async (req: Request, res: Response) => {
   try {
-    const result = await query('SELECT * FROM tables ORDER BY number ASC');
+    const cafeId = String(req.query.cafeId || '');
+    if (!cafeId) return res.status(400).json({ error: 'cafeId is required' });
+    const result = await query('SELECT * FROM tables WHERE cafe_id = $1 ORDER BY number ASC', [cafeId]);
     res.json(result.rows.map(mapTable));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.post('/tables', async (req: Request, res: Response) => {
+protectedRouter.post('/tables', async (req: Request, res: Response) => {
   try {
     console.log('[POST /tables] Creating table with body:', JSON.stringify(req.body));
     const t = req.body;
     if (!t || !t.number) {
       return res.status(400).json({ error: 'Missing required field: number' });
     }
-    
-    const cafeId = await getCafeId();
+
+    const cafeId = req.cafeId!;
     console.log('[POST /tables] Using cafe_id:', cafeId);
-    
+
     const cleanNum = t.number.replace(/[^0-9]/g, '') || String(Date.now()).slice(-2);
     const id = `table-${cleanNum}`;
     const code = `table-${cleanNum}`;
-    
+
     const result = await query(
       `INSERT INTO tables (id, cafe_id, number, code, capacity, status)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
       [id, cafeId, t.number, code, t.capacity || 4, t.status || 'available']
     );
-    
+
     console.log('[POST /tables] Success, created table id:', id);
-    notifyResourceChanged('tables');
+    notifyResourceChanged(cafeId, 'tables');
     res.json(mapTable(result.rows[0]));
   } catch (err: any) {
     console.error('[POST /tables] Error:', err);
-    res.status(500).json({ 
-      error: err.message, 
-      detail: err.detail, 
+    res.status(500).json({
+      error: err.message,
+      detail: err.detail,
       code: err.code,
-      hint: err.hint 
+      hint: err.hint
     });
   }
 });
 
-apiRouter.patch('/tables/:id', async (req: Request, res: Response) => {
+protectedRouter.patch('/tables/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const cafeId = req.cafeId!;
     const updates = req.body;
     const fields: string[] = [];
     const values: any[] = [];
@@ -296,23 +308,28 @@ apiRouter.patch('/tables/:id', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'No fields to update' });
     }
 
-    values.push(id);
+    values.push(id, cafeId);
     const result = await query(
-      `UPDATE tables SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+      `UPDATE tables SET ${fields.join(', ')} WHERE id = $${idx} AND cafe_id = $${idx + 1} RETURNING *`,
       values
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Table not found' });
-    notifyResourceChanged('tables');
+    notifyResourceChanged(cafeId, 'tables');
     res.json(mapTable(result.rows[0]));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.delete('/tables/:id', async (req: Request, res: Response) => {
+protectedRouter.delete('/tables/:id', async (req: Request, res: Response) => {
   try {
-    await query('DELETE FROM tables WHERE id = $1', [req.params.id]);
-    notifyResourceChanged('tables');
+    const cafeId = req.cafeId!;
+    const result = await query('DELETE FROM tables WHERE id = $1 AND cafe_id = $2 RETURNING id', [
+      req.params.id,
+      cafeId,
+    ]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Table not found' });
+    notifyResourceChanged(cafeId, 'tables');
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -323,23 +340,25 @@ apiRouter.delete('/tables/:id', async (req: Request, res: Response) => {
 // Kept intentionally simple: the cafe admin adds a name/email/password/role
 // here, and the resulting account can sign in at the staff portal. Every
 // account belongs to the single cafe row (same pattern as tables/menu).
-apiRouter.get('/admin-users', async (req: Request, res: Response) => {
+protectedRouter.get('/admin-users', async (req: Request, res: Response) => {
   try {
-    const result = await query('SELECT * FROM admin_users ORDER BY created_at DESC');
+    const result = await query('SELECT * FROM admin_users WHERE cafe_id = $1 ORDER BY created_at DESC', [
+      req.cafeId,
+    ]);
     res.json(result.rows.map(mapStaff));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.post('/admin-users', async (req: Request, res: Response) => {
+protectedRouter.post('/admin-users', async (req: Request, res: Response) => {
   try {
     const s = req.body;
     if (!s || !s.name || !s.email || !s.password) {
       return res.status(400).json({ error: 'Missing required field: name, email, password' });
     }
     const role = s.role === 'admin' ? 'admin' : s.role === 'staff' ? 'staff' : 'kitchen';
-    const cafeId = await getCafeId();
+    const cafeId = req.cafeId!;
     const id = `staff-${Date.now()}`;
     const passwordHash = hashPassword(s.password);
 
@@ -359,9 +378,13 @@ apiRouter.post('/admin-users', async (req: Request, res: Response) => {
   }
 });
 
-apiRouter.delete('/admin-users/:id', async (req: Request, res: Response) => {
+protectedRouter.delete('/admin-users/:id', async (req: Request, res: Response) => {
   try {
-    await query('DELETE FROM admin_users WHERE id = $1', [req.params.id]);
+    const result = await query('DELETE FROM admin_users WHERE id = $1 AND cafe_id = $2 RETURNING id', [
+      req.params.id,
+      req.cafeId,
+    ]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Staff account not found' });
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -370,9 +393,9 @@ apiRouter.delete('/admin-users/:id', async (req: Request, res: Response) => {
 
 // Lets the cafe admin set a new password for a staff account (e.g. they
 // forgot it, or it should be rotated) without needing the old one — the
-// admin console itself is the trusted party here, same as everywhere else
-// this app doesn't yet have admin-session auth of its own.
-apiRouter.patch('/admin-users/:id/password', async (req: Request, res: Response) => {
+// admin console itself is the trusted party here (requireAuth already
+// confirms the caller is signed in as staff of this same cafe).
+protectedRouter.patch('/admin-users/:id/password', async (req: Request, res: Response) => {
   try {
     const { password } = req.body || {};
     if (!password || String(password).length < 6) {
@@ -380,8 +403,8 @@ apiRouter.patch('/admin-users/:id/password', async (req: Request, res: Response)
     }
     const passwordHash = hashPassword(password);
     const result = await query(
-      'UPDATE admin_users SET password_hash = $1 WHERE id = $2 RETURNING *',
-      [passwordHash, req.params.id]
+      'UPDATE admin_users SET password_hash = $1 WHERE id = $2 AND cafe_id = $3 RETURNING *',
+      [passwordHash, req.params.id, req.cafeId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Staff account not found' });
     res.json(mapStaff(result.rows[0]));
@@ -401,47 +424,58 @@ function authFail(res: Response, payload: { error: string }) {
   return res.status(200).json({ ok: false, ...payload });
 }
 
+// admin_users.email is only unique per cafe now (see migrations/005), so a
+// login lookup by email alone would be ambiguous across cafes. The frontend
+// already knows which cafe it's on (the staff portal is reached via that
+// cafe's own URL), so it sends cafeId along with the credentials.
 apiRouter.post('/auth/login', async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body || {};
-    if (!email || !password) {
-      return authFail(res, { error: 'Missing email or password' });
+    const { cafeId, email, password } = req.body || {};
+    if (!cafeId || !email || !password) {
+      return authFail(res, { error: 'Missing cafeId, email or password' });
     }
-    const result = await query('SELECT * FROM admin_users WHERE email = $1', [
+    const result = await query('SELECT * FROM admin_users WHERE cafe_id = $1 AND email = $2', [
+      cafeId,
       String(email).toLowerCase().trim(),
     ]);
     const row = result.rows[0];
     if (!row || !row.password_hash || !verifyPassword(password, row.password_hash)) {
       return authFail(res, { error: 'Invalid email or password' });
     }
-    res.json(mapStaff(row));
+    const token = jwt.sign({ sub: row.id, cafeId: row.cafe_id, role: row.role }, process.env.JWT_SECRET!, {
+      expiresIn: '30d',
+    });
+    res.json({ token, user: mapStaff(row) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // Lets a signed-in person change their own password. Unlike the admin-side
-// reset above, this insists on the current password, so an unlocked admin
-// session alone can't silently take over the account.
-apiRouter.post('/auth/change-password', async (req: Request, res: Response) => {
+// reset above, this insists on the current password, so a stolen/borrowed
+// token alone can't silently take over the account. The account is looked
+// up by the token's own subject + cafe rather than a client-supplied email,
+// so this can never be used to touch another account.
+protectedRouter.post('/auth/change-password', async (req: Request, res: Response) => {
   try {
-    const { email, currentPassword, newPassword } = req.body || {};
-    if (!email || !currentPassword || !newPassword) {
-      return authFail(res, { error: 'Missing email, current password or new password' });
+    const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || !newPassword) {
+      return authFail(res, { error: 'Missing current password or new password' });
     }
     if (String(newPassword).length < 6) {
       return authFail(res, { error: 'New password must be at least 6 characters' });
     }
-    const result = await query('SELECT * FROM admin_users WHERE email = $1', [
-      String(email).toLowerCase().trim(),
+    const result = await query('SELECT * FROM admin_users WHERE id = $1 AND cafe_id = $2', [
+      req.userId,
+      req.cafeId,
     ]);
     const row = result.rows[0];
     if (!row || !row.password_hash || !verifyPassword(currentPassword, row.password_hash)) {
       return authFail(res, { error: 'Current password is incorrect' });
     }
     const updated = await query(
-      'UPDATE admin_users SET password_hash = $1 WHERE id = $2 RETURNING *',
-      [hashPassword(newPassword), row.id]
+      'UPDATE admin_users SET password_hash = $1 WHERE id = $2 AND cafe_id = $3 RETURNING *',
+      [hashPassword(newPassword), row.id, req.cafeId]
     );
     res.json(mapStaff(updated.rows[0]));
   } catch (err: any) {
@@ -467,15 +501,16 @@ function appBaseUrl(req: Request): string {
 
 apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
   try {
-    const { email } = req.body || {};
-    if (!email) return authFail(res, { error: 'Missing email' });
+    const { cafeId, email } = req.body || {};
+    if (!cafeId || !email) return authFail(res, { error: 'Missing cafeId or email' });
     if (!isMailConfigured()) {
       return authFail(res, {
         error: 'Password reset email is not set up for this cafe. Ask whoever hosts the app to configure SMTP_USER / SMTP_PASS.',
       });
     }
 
-    const result = await query('SELECT * FROM admin_users WHERE email = $1', [
+    const result = await query('SELECT * FROM admin_users WHERE cafe_id = $1 AND email = $2', [
+      cafeId,
       String(email).toLowerCase().trim(),
     ]);
     const row = result.rows[0];
@@ -484,12 +519,12 @@ apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
 
     const token = generateResetToken();
     await query(
-      `INSERT INTO password_resets (token_hash, user_id, expires_at)
-       VALUES ($1, $2, now() + ($3 || ' minutes')::interval)`,
-      [hashResetToken(token), row.id, String(RESET_TOKEN_TTL_MINUTES)]
+      `INSERT INTO password_resets (token_hash, cafe_id, user_id, expires_at)
+       VALUES ($1, $2, $3, now() + ($4 || ' minutes')::interval)`,
+      [hashResetToken(token), row.cafe_id, row.id, String(RESET_TOKEN_TTL_MINUTES)]
     );
 
-    const cafe = await query('SELECT name FROM cafes LIMIT 1');
+    const cafe = await query('SELECT name FROM cafes WHERE id = $1', [row.cafe_id]);
     const cafeName = cafe.rows[0]?.name || 'Cafe';
     const resetUrl = `${appBaseUrl(req)}/reset-password?token=${token}`;
 
@@ -523,8 +558,8 @@ apiRouter.post('/auth/reset-password', async (req: Request, res: Response) => {
       return authFail(res, { error: 'New password must be at least 6 characters' });
     }
     const found = await query(
-      `SELECT r.token_hash, r.user_id, r.expires_at, r.used_at, u.email
-       FROM password_resets r JOIN admin_users u ON u.id = r.user_id
+      `SELECT r.token_hash, r.cafe_id, r.user_id, r.expires_at, r.used_at, u.email
+       FROM password_resets r JOIN admin_users u ON u.id = r.user_id AND u.cafe_id = r.cafe_id
        WHERE r.token_hash = $1`,
       [hashResetToken(String(token))]
     );
@@ -534,9 +569,10 @@ apiRouter.post('/auth/reset-password', async (req: Request, res: Response) => {
         error: 'This reset link is invalid or has expired. Request a new one from the login page.',
       });
     }
-    await query('UPDATE admin_users SET password_hash = $1 WHERE id = $2', [
+    await query('UPDATE admin_users SET password_hash = $1 WHERE id = $2 AND cafe_id = $3', [
       hashPassword(newPassword),
       row.user_id,
+      row.cafe_id,
     ]);
     await query('UPDATE password_resets SET used_at = now() WHERE token_hash = $1', [row.token_hash]);
     res.json({ ok: true, email: row.email });
@@ -550,10 +586,11 @@ apiRouter.post('/auth/reset-password', async (req: Request, res: Response) => {
 // Kitchen display and Admin dashboard until they mark them done.
 const SERVICE_REQUEST_TYPES = new Set(['water', 'server']);
 
-apiRouter.get('/service-requests', async (_req: Request, res: Response) => {
+protectedRouter.get('/service-requests', async (req: Request, res: Response) => {
   try {
     const result = await query(
-      `SELECT * FROM service_requests WHERE status = 'pending' ORDER BY created_at ASC`
+      `SELECT * FROM service_requests WHERE cafe_id = $1 AND status = 'pending' ORDER BY created_at ASC`,
+      [req.cafeId]
     );
     res.json(result.rows.map(mapServiceRequest));
   } catch (err: any) {
@@ -561,13 +598,13 @@ apiRouter.get('/service-requests', async (_req: Request, res: Response) => {
   }
 });
 
+// Public: raised by a customer from the order-tracking screen, no login.
 apiRouter.post('/service-requests', async (req: Request, res: Response) => {
   try {
-    const { tableId, tableNumber, type } = req.body || {};
-    if (!tableId || !tableNumber || !SERVICE_REQUEST_TYPES.has(type)) {
-      return res.status(400).json({ error: 'tableId, tableNumber and a valid type are required' });
+    const { cafeId, tableId, tableNumber, type } = req.body || {};
+    if (!cafeId || !tableId || !tableNumber || !SERVICE_REQUEST_TYPES.has(type)) {
+      return res.status(400).json({ error: 'cafeId, tableId, tableNumber and a valid type are required' });
     }
-    const cafeId = await getCafeId();
 
     // A table tapping the same button twice shouldn't page the staff twice.
     // While one request of that kind is still open, hand it back unchanged.
@@ -588,25 +625,26 @@ apiRouter.post('/service-requests', async (req: Request, res: Response) => {
        RETURNING *`,
       [id, cafeId, tableId, tableNumber, type]
     );
-    notifyResourceChanged('service_requests');
+    notifyResourceChanged(cafeId, 'service_requests');
     res.status(201).json(mapServiceRequest(result.rows[0]));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.patch('/service-requests/:id/resolve', async (req: Request, res: Response) => {
+protectedRouter.patch('/service-requests/:id/resolve', async (req: Request, res: Response) => {
   try {
+    const cafeId = req.cafeId!;
     const result = await query(
       `UPDATE service_requests SET status = 'resolved', resolved_at = now()
-       WHERE id = $1 AND status = 'pending'
+       WHERE id = $1 AND cafe_id = $2 AND status = 'pending'
        RETURNING *`,
-      [req.params.id]
+      [req.params.id, cafeId]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Request not found or already resolved' });
     }
-    notifyResourceChanged('service_requests');
+    notifyResourceChanged(cafeId, 'service_requests');
     res.json(mapServiceRequest(result.rows[0]));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -614,70 +652,82 @@ apiRouter.patch('/service-requests/:id/resolve', async (req: Request, res: Respo
 });
 
 // --- CATEGORIES ---
+// Public: part of the customer menu view.
 apiRouter.get('/categories', async (req: Request, res: Response) => {
   try {
-    const result = await query('SELECT * FROM categories ORDER BY display_order ASC, name ASC');
+    const cafeId = String(req.query.cafeId || '');
+    if (!cafeId) return res.status(400).json({ error: 'cafeId is required' });
+    const result = await query(
+      'SELECT * FROM categories WHERE cafe_id = $1 ORDER BY display_order ASC, name ASC',
+      [cafeId]
+    );
     res.json(result.rows.map(mapCategory));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.post('/categories', async (req: Request, res: Response) => {
+protectedRouter.post('/categories', async (req: Request, res: Response) => {
   try {
     console.log('[POST /categories] Creating category with body:', JSON.stringify(req.body));
     const { name, icon } = req.body;
     if (!name) {
       return res.status(400).json({ error: 'Missing required field: name' });
     }
-    
-    const cafeId = await getCafeId();
+
+    const cafeId = req.cafeId!;
     console.log('[POST /categories] Using cafe_id:', cafeId);
-    
+
     const id = `cat-${Date.now()}`;
-    const countRes = await query('SELECT count(*) FROM categories');
+    const countRes = await query('SELECT count(*) FROM categories WHERE cafe_id = $1', [cafeId]);
     const displayOrder = parseInt(countRes.rows[0].count, 10) + 1;
-    
+
     const result = await query(
       `INSERT INTO categories (id, cafe_id, name, icon, display_order)
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [id, cafeId, name, icon || 'Utensils', displayOrder]
     );
-    
+
     console.log('[POST /categories] Success, created category id:', id);
-    notifyResourceChanged('categories');
+    notifyResourceChanged(cafeId, 'categories');
     res.json(mapCategory(result.rows[0]));
   } catch (err: any) {
     console.error('[POST /categories] Error:', err);
-    res.status(500).json({ 
-      error: err.message, 
-      detail: err.detail, 
+    res.status(500).json({
+      error: err.message,
+      detail: err.detail,
       code: err.code,
-      hint: err.hint 
+      hint: err.hint
     });
   }
 });
 
-apiRouter.put('/categories/:id', async (req: Request, res: Response) => {
+protectedRouter.put('/categories/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const cafeId = req.cafeId!;
     const { name, icon } = req.body;
     const result = await query(
-      'UPDATE categories SET name = $1, icon = COALESCE($2, icon) WHERE id = $3 RETURNING *',
-      [name, icon, id]
+      'UPDATE categories SET name = $1, icon = COALESCE($2, icon) WHERE id = $3 AND cafe_id = $4 RETURNING *',
+      [name, icon, id, cafeId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Category not found' });
-    notifyResourceChanged('categories');
+    notifyResourceChanged(cafeId, 'categories');
     res.json(mapCategory(result.rows[0]));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.delete('/categories/:id', async (req: Request, res: Response) => {
+protectedRouter.delete('/categories/:id', async (req: Request, res: Response) => {
   try {
-    await query('DELETE FROM categories WHERE id = $1', [req.params.id]);
-    notifyResourceChanged('categories');
+    const cafeId = req.cafeId!;
+    const result = await query('DELETE FROM categories WHERE id = $1 AND cafe_id = $2 RETURNING id', [
+      req.params.id,
+      cafeId,
+    ]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Category not found' });
+    notifyResourceChanged(cafeId, 'categories');
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -685,26 +735,29 @@ apiRouter.delete('/categories/:id', async (req: Request, res: Response) => {
 });
 
 // --- MENU ITEMS ---
+// Public: part of the customer menu view.
 apiRouter.get('/menu', async (req: Request, res: Response) => {
   try {
-    const result = await query('SELECT * FROM menu_items ORDER BY name ASC');
+    const cafeId = String(req.query.cafeId || '');
+    if (!cafeId) return res.status(400).json({ error: 'cafeId is required' });
+    const result = await query('SELECT * FROM menu_items WHERE cafe_id = $1 ORDER BY name ASC', [cafeId]);
     res.json(result.rows.map(mapMenuItem));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.post('/menu', async (req: Request, res: Response) => {
+protectedRouter.post('/menu', async (req: Request, res: Response) => {
   try {
     console.log('[POST /menu] Creating menu item with body:', JSON.stringify(req.body));
     const item = req.body;
     if (!item || !item.name || !item.price || !item.categoryId || !item.vegType) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: name, price, categoryId, vegType' 
+      return res.status(400).json({
+        error: 'Missing required fields: name, price, categoryId, vegType'
       });
     }
-    
-    const cafeId = await getCafeId();
+
+    const cafeId = req.cafeId!;
     console.log('[POST /menu] Using cafe_id:', cafeId);
     
     const id = `item-${Date.now()}`;
@@ -728,25 +781,26 @@ apiRouter.post('/menu', async (req: Request, res: Response) => {
     );
     
     console.log('[POST /menu] Success, created menu item id:', id);
-    notifyResourceChanged('menu');
+    notifyResourceChanged(cafeId, 'menu');
     res.json(mapMenuItem(result.rows[0]));
   } catch (err: any) {
     console.error('[POST /menu] Error:', err);
-    res.status(500).json({ 
-      error: err.message, 
-      detail: err.detail, 
+    res.status(500).json({
+      error: err.message,
+      detail: err.detail,
       code: err.code,
-      hint: err.hint 
+      hint: err.hint
     });
   }
 });
 
-apiRouter.put('/menu/:id', async (req: Request, res: Response) => {
+protectedRouter.put('/menu/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const cafeId = req.cafeId!;
     const item = req.body;
     const result = await query(
-      `UPDATE menu_items SET 
+      `UPDATE menu_items SET
         name = COALESCE($1, name),
         description = COALESCE($2, description),
         price = COALESCE($3, price),
@@ -756,7 +810,7 @@ apiRouter.put('/menu/:id', async (req: Request, res: Response) => {
         is_available = COALESCE($7, is_available),
         preparation_time_min = COALESCE($8, preparation_time_min),
         customization_groups = COALESCE($9, customization_groups)
-       WHERE id = $10
+       WHERE id = $10 AND cafe_id = $11
        RETURNING *`,
       [
         item.name,
@@ -769,35 +823,42 @@ apiRouter.put('/menu/:id', async (req: Request, res: Response) => {
         item.preparationTimeMin,
         item.customizationGroups ? JSON.stringify(item.customizationGroups) : null,
         id,
+        cafeId,
       ]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-    notifyResourceChanged('menu');
+    notifyResourceChanged(cafeId, 'menu');
     res.json(mapMenuItem(result.rows[0]));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.patch('/menu/:id/availability', async (req: Request, res: Response) => {
+protectedRouter.patch('/menu/:id/availability', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const cafeId = req.cafeId!;
     const result = await query(
-      'UPDATE menu_items SET is_available = NOT is_available WHERE id = $1 RETURNING *',
-      [id]
+      'UPDATE menu_items SET is_available = NOT is_available WHERE id = $1 AND cafe_id = $2 RETURNING *',
+      [id, cafeId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-    notifyResourceChanged('menu');
+    notifyResourceChanged(cafeId, 'menu');
     res.json({ isAvailable: result.rows[0].is_available });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.delete('/menu/:id', async (req: Request, res: Response) => {
+protectedRouter.delete('/menu/:id', async (req: Request, res: Response) => {
   try {
-    await query('DELETE FROM menu_items WHERE id = $1', [req.params.id]);
-    notifyResourceChanged('menu');
+    const cafeId = req.cafeId!;
+    const result = await query('DELETE FROM menu_items WHERE id = $1 AND cafe_id = $2 RETURNING id', [
+      req.params.id,
+      cafeId,
+    ]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    notifyResourceChanged(cafeId, 'menu');
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -838,9 +899,10 @@ function computeRoundPrepTime(items: any[]): number {
 
 // Orders the kitchen still has to cook — 'received' (not accepted yet) and
 // 'preparing' (on the pass). 'ready' is already cooked, so it holds nobody up.
-async function getKitchenQueueLoad(): Promise<number> {
+async function getKitchenQueueLoad(cafeId: string): Promise<number> {
   const res = await query(
-    `SELECT count(*) FROM orders WHERE status IN ('received', 'preparing')`
+    `SELECT count(*) FROM orders WHERE cafe_id = $1 AND status IN ('received', 'preparing')`,
+    [cafeId]
   );
   return Number(res.rows[0].count) || 0;
 }
@@ -849,10 +911,10 @@ async function getKitchenQueueLoad(): Promise<number> {
 // worked out, else this round's cooking time plus the backlog surcharge when
 // the kitchen is over the threshold. Call BEFORE inserting the new order so it
 // does not count itself.
-async function resolveNewRoundPrepTime(orderData: any): Promise<number> {
+async function resolveNewRoundPrepTime(orderData: any, cafeId: string): Promise<number> {
   if (orderData?.estimatedPrepTimeMin) return Number(orderData.estimatedPrepTimeMin);
   const base = computeRoundPrepTime(orderData?.items);
-  const queueLoad = await getKitchenQueueLoad();
+  const queueLoad = await getKitchenQueueLoad(cafeId);
   return queueLoad >= KITCHEN_BUSY_THRESHOLD ? base + KITCHEN_BUSY_EXTRA_MIN : base;
 }
 
@@ -868,16 +930,26 @@ function orderIdNumber(id: string | undefined | null): number | null {
 // stored order are skipped rather than reused: the id is the primary key, so
 // after a wrap the ones that haven't been cleared out yet are not free to
 // hand out again.
-async function allocateOrderId(): Promise<string> {
+//
+// NOTE: orders.id is the table's global primary key, and this table is now
+// shared across every cafe. Scoping the "taken" check by cafe_id keeps the
+// 1001-9009 cycle per-cafe (matching how the client's own local counter
+// works), but that means two different cafes' orders can legitimately want
+// the same ORD-xxxx id at the same time, which the shared PK cannot hold
+// simultaneously — a real residual collision risk this migration doesn't
+// resolve. Flagging it rather than silently shipping it.
+async function allocateOrderId(cafeId: string): Promise<string> {
   const takenRes = await query(
-    `SELECT substring(id from 5)::int AS n FROM orders WHERE id ~ '^ORD-[0-9]+$'`
+    `SELECT substring(id from 5)::int AS n FROM orders WHERE cafe_id = $1 AND id ~ '^ORD-[0-9]+$'`,
+    [cafeId]
   );
   const taken = new Set<number>(takenRes.rows.map((r: any) => Number(r.n)));
 
   // Continue from the most recently placed order rather than the highest
   // number, which would sit at the top of the range forever once it wraps.
   const lastRes = await query(
-    `SELECT id FROM orders WHERE id ~ '^ORD-[0-9]+$' ORDER BY created_at DESC LIMIT 1`
+    `SELECT id FROM orders WHERE cafe_id = $1 AND id ~ '^ORD-[0-9]+$' ORDER BY created_at DESC LIMIT 1`,
+    [cafeId]
   );
   const lastNumber = orderIdNumber(lastRes.rows[0]?.id);
 
@@ -894,21 +966,24 @@ async function allocateOrderId(): Promise<string> {
   return `ORD-${candidate}`;
 }
 
-async function fetchFullOrders(whereClause = '', params: any[] = []) {
+// cafeId is always the first bound param ($1); extraWhere/extraParams add
+// further conditions starting at $2 (e.g. 'AND id = $2').
+async function fetchFullOrders(cafeId: string, extraWhere = '', extraParams: any[] = []) {
   const ordersQuery = `
     SELECT * FROM orders
-    ${whereClause}
+    WHERE cafe_id = $1
+    ${extraWhere}
     ORDER BY created_at DESC
   `;
-  const ordersRes = await query(ordersQuery, params);
+  const ordersRes = await query(ordersQuery, [cafeId, ...extraParams]);
   if (ordersRes.rows.length === 0) return [];
 
   const orderIds = ordersRes.rows.map((o) => o.id);
 
   // Fetch all rounds for these orders
   const roundsRes = await query(
-    `SELECT * FROM order_rounds WHERE order_id = ANY($1::text[]) ORDER BY order_id, round_number ASC`,
-    [orderIds]
+    `SELECT * FROM order_rounds WHERE order_id = ANY($1::text[]) AND cafe_id = $2 ORDER BY order_id, round_number ASC`,
+    [orderIds, cafeId]
   );
 
   const roundIds = roundsRes.rows.map((r) => r.id);
@@ -917,8 +992,8 @@ async function fetchFullOrders(whereClause = '', params: any[] = []) {
   let itemsRes: any = { rows: [] };
   if (roundIds.length > 0) {
     itemsRes = await query(
-      `SELECT * FROM order_items WHERE order_round_id = ANY($1::uuid[])`,
-      [roundIds]
+      `SELECT * FROM order_items WHERE order_round_id = ANY($1::uuid[]) AND cafe_id = $2`,
+      [roundIds, cafeId]
     );
   }
 
@@ -1010,14 +1085,14 @@ async function fetchFullOrders(whereClause = '', params: any[] = []) {
 // `tz` decides where a day starts. An 11pm order in Asia/Kolkata belongs to
 // that day, not to the next one as UTC would have it, so the caller passes its
 // own zone and the same boundary is used for both the maths and the stored row.
-apiRouter.get('/revenue/daily', async (req: Request, res: Response) => {
+protectedRouter.get('/revenue/daily', async (req: Request, res: Response) => {
   try {
     const month = String(req.query.month || '');
     if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
       return res.status(400).json({ error: 'month must be formatted YYYY-MM' });
     }
     const timeZone = String(req.query.tz || 'UTC');
-    const cafeId = await getCafeId();
+    const cafeId = req.cafeId!;
 
     // Cancelled orders never earned anything, so they are left out of every
     // figure here — matching what the dashboard's other money tiles show.
@@ -1111,15 +1186,16 @@ apiRouter.get('/revenue/daily', async (req: Request, res: Response) => {
   }
 });
 
-apiRouter.get('/orders', async (req: Request, res: Response) => {
+protectedRouter.get('/orders', async (req: Request, res: Response) => {
   try {
-    const orders = await fetchFullOrders();
+    const orders = await fetchFullOrders(req.cafeId!);
     res.json(orders);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// Public: this is how a customer places an order from the QR menu, no login.
 apiRouter.post('/orders', async (req: Request, res: Response) => {
   try {
     const orderData = req.body;
@@ -1127,10 +1203,11 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
     console.log('[POST /orders] tableId:', orderData?.tableId, '| items count:', orderData?.items?.length);
 
     // Body-parse guard: if body is empty the JSON middleware didn't run
-    if (!orderData || typeof orderData !== 'object' || !orderData.tableId) {
+    if (!orderData || typeof orderData !== 'object' || !orderData.tableId || !orderData.cafeId) {
       console.error('[POST /orders] Bad or missing body:', orderData);
       return res.status(400).json({ error: 'Missing or invalid request body. Received: ' + JSON.stringify(orderData) });
     }
+    const cafeId = String(orderData.cafeId);
     const forceNew = req.query.force === 'true';
 
     // Idempotency guard. The client POSTs with the id it already assigned
@@ -1141,8 +1218,8 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
     // round per retry. If we already have this id, the write is already done.
     if (orderData.id) {
       const existingById = await query(
-        'SELECT id, table_id, total, created_at FROM orders WHERE id = $1',
-        [orderData.id]
+        'SELECT id, table_id, total, created_at FROM orders WHERE id = $1 AND cafe_id = $2',
+        [orderData.id, cafeId]
       );
       if (existingById.rows.length > 0) {
         const row = existingById.rows[0];
@@ -1161,7 +1238,7 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
 
         if (isResend) {
           console.log('[POST /orders] duplicate re-send of', orderData.id, '— returning stored order');
-          const alreadyStored = await fetchFullOrders('WHERE id = $1', [orderData.id]);
+          const alreadyStored = await fetchFullOrders(cafeId, 'AND id = $2', [orderData.id]);
           return res.json(alreadyStored[0]);
         }
 
@@ -1182,8 +1259,10 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
 
     // Ensure table exists in tables DB table to avoid FK constraint failure
     if (orderData.tableId) {
-      const cafeId = await getCafeId();
-      const tableCheck = await query('SELECT id FROM tables WHERE id = $1', [orderData.tableId]);
+      const tableCheck = await query('SELECT id FROM tables WHERE id = $1 AND cafe_id = $2', [
+        orderData.tableId,
+        cafeId,
+      ]);
       if (tableCheck.rows.length === 0) {
         await query(
           `INSERT INTO tables (id, cafe_id, number, code, capacity, status)
@@ -1204,7 +1283,7 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
     // Helper function to resolve valid menuItemId that exists in DB
     const getValidMenuItemId = async (rawId?: string): Promise<string | null> => {
       if (!rawId) return null;
-      const check = await query('SELECT id FROM menu_items WHERE id = $1', [rawId]);
+      const check = await query('SELECT id FROM menu_items WHERE id = $1 AND cafe_id = $2', [rawId, cafeId]);
       return check.rows.length > 0 ? rawId : null;
     };
 
@@ -1223,19 +1302,20 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
         `SELECT o.id FROM orders o
          JOIN tables t ON t.id = o.table_id
          WHERE o.table_id = $1
+           AND o.cafe_id = $2
            AND t.status = 'occupied'
            AND o.status <> 'cancelled'
            AND o.payment_status <> 'paid'
          ORDER BY (o.id = t.active_order_id) DESC, o.created_at DESC
          LIMIT 1`,
-        [orderData.tableId]
+        [orderData.tableId, cafeId]
       );
 
       if (activeRes.rows.length > 0) {
         const existing = activeRes.rows[0];
 
         // Calculate prep time for new round
-        const prepTime = await resolveNewRoundPrepTime(orderData);
+        const prepTime = await resolveNewRoundPrepTime(orderData, cafeId);
 
         // Claim the next round number in the same statement that increments it.
         // Two people ordering for this table at the same moment serialise on
@@ -1254,18 +1334,18 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
             subtotal = subtotal + $2,
             total = total + $3,
             updated_at = now()
-           WHERE id = $1
+           WHERE id = $1 AND cafe_id = $4
            RETURNING order_rounds_count`,
-          [existing.id, Number(orderData.subtotal) || 0, Number(orderData.total) || 0]
+          [existing.id, Number(orderData.subtotal) || 0, Number(orderData.total) || 0, cafeId]
         );
         const newRoundNumber = Number(bumped.rows[0].order_rounds_count);
 
         // Create new round in DB
         const roundRes = await query(
-          `INSERT INTO order_rounds (order_id, round_number, placed_at, estimated_prep_time_min, status)
-           VALUES ($1, $2, now(), $3, 'received')
+          `INSERT INTO order_rounds (order_id, cafe_id, round_number, placed_at, estimated_prep_time_min, status)
+           VALUES ($1, $2, $3, now(), $4, 'received')
            RETURNING id`,
-          [existing.id, newRoundNumber, prepTime]
+          [existing.id, cafeId, newRoundNumber, prepTime]
         );
         const roundId = roundRes.rows[0].id;
 
@@ -1273,10 +1353,11 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
         for (const it of orderData.items || []) {
           const validMenuItemId = await getValidMenuItemId(it.menuItemId);
           await query(
-            `INSERT INTO order_items (order_round_id, menu_item_id, name, price, veg_type, quantity, item_total, special_instructions, preparation_time_min, selected_customizations)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            `INSERT INTO order_items (order_round_id, cafe_id, menu_item_id, name, price, veg_type, quantity, item_total, special_instructions, preparation_time_min, selected_customizations)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
             [
               roundId,
+              cafeId,
               validMenuItemId,
               it.name,
               it.price,
@@ -1297,19 +1378,19 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
         // A round added to a bill the kitchen had already finished has to pull
         // the order back into the active queue — without this the order keeps
         // its 'served' status and the new round is never cooked.
-        await recomputeOrderStatus(existing.id);
+        await recomputeOrderStatus(existing.id, cafeId);
 
         // Keep the table pinned to the bill this round just joined. A no-op
         // in the normal case, but it heals a table whose occupied flag was
         // lost, rather than leaving the board disagreeing with the orders.
         await query(
-          `UPDATE tables SET status = 'occupied', active_order_id = $1 WHERE id = $2`,
-          [existing.id, orderData.tableId]
+          `UPDATE tables SET status = 'occupied', active_order_id = $1 WHERE id = $2 AND cafe_id = $3`,
+          [existing.id, orderData.tableId, cafeId]
         );
 
-        const updatedOrders = await fetchFullOrders('WHERE id = $1', [existing.id]);
-        notifyResourceChanged('orders');
-        notifyResourceChanged('tables');
+        const updatedOrders = await fetchFullOrders(cafeId, 'AND id = $2', [existing.id]);
+        notifyResourceChanged(cafeId, 'orders');
+        notifyResourceChanged(cafeId, 'tables');
         return res.json(updatedOrders[0]);
       }
     }
@@ -1317,11 +1398,10 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
     // 2. Create fresh new order
     // Worked out before the INSERT below so this order is not counted as part
     // of the backlog it is being measured against.
-    const prepTime = await resolveNewRoundPrepTime(orderData);
+    const prepTime = await resolveNewRoundPrepTime(orderData, cafeId);
 
-    const orderId = orderData.id || (await allocateOrderId());
+    const orderId = orderData.id || (await allocateOrderId(cafeId));
     console.log('[POST /orders] inserting order id:', orderId);
-    const cafeId = await getCafeId();
     await query(
       `INSERT INTO orders (id, cafe_id, table_id, table_number, status, customer_name, customer_phone, special_instructions, payment_method, payment_status, subtotal, tax, service_charge, total, order_rounds_count)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 1)`,
@@ -1350,10 +1430,10 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
     // silently reset the timer's origin to placed_at on the next sync.
     const round1Status = orderData.status || 'received';
     const roundRes = await query(
-      `INSERT INTO order_rounds (order_id, round_number, placed_at, estimated_prep_time_min, status, preparing_started_at)
-       VALUES ($1, 1, now(), $2, $3, CASE WHEN $3 = 'preparing' THEN now() ELSE NULL END)
+      `INSERT INTO order_rounds (order_id, cafe_id, round_number, placed_at, estimated_prep_time_min, status, preparing_started_at)
+       VALUES ($1, $2, 1, now(), $3, $4, CASE WHEN $4 = 'preparing' THEN now() ELSE NULL END)
        RETURNING id`,
-      [orderId, prepTime, round1Status]
+      [orderId, cafeId, prepTime, round1Status]
     );
     const roundId = roundRes.rows[0].id;
     console.log('[POST /orders] round 1 inserted, id:', roundId, '| inserting', (orderData.items || []).length, 'items...');
@@ -1363,10 +1443,11 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
       const validMenuItemId = await getValidMenuItemId(it.menuItemId);
       console.log('[POST /orders] inserting item:', it.name, '| menuItemId:', validMenuItemId);
       await query(
-        `INSERT INTO order_items (order_round_id, menu_item_id, name, price, veg_type, quantity, item_total, special_instructions, preparation_time_min, selected_customizations)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        `INSERT INTO order_items (order_round_id, cafe_id, menu_item_id, name, price, veg_type, quantity, item_total, special_instructions, preparation_time_min, selected_customizations)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           roundId,
+          cafeId,
           validMenuItemId,
           it.name,
           it.price,
@@ -1383,15 +1464,15 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
 
     // Mark table occupied
     await query(
-      `UPDATE tables SET status = 'occupied', active_order_id = $1 WHERE id = $2`,
-      [orderId, orderData.tableId]
+      `UPDATE tables SET status = 'occupied', active_order_id = $1 WHERE id = $2 AND cafe_id = $3`,
+      [orderId, orderData.tableId, cafeId]
     );
     console.log('[POST /orders] table updated, fetching full order...');
 
-    const created = await fetchFullOrders('WHERE id = $1', [orderId]);
+    const created = await fetchFullOrders(cafeId, 'AND id = $2', [orderId]);
     console.log('[POST /orders] success, responding with order:', created[0]?.id);
-    notifyResourceChanged('orders');
-    notifyResourceChanged('tables');
+    notifyResourceChanged(cafeId, 'orders');
+    notifyResourceChanged(cafeId, 'tables');
     res.json(created[0]);
   } catch (err: any) {
     console.error('[POST /orders Error]:', err);
@@ -1407,15 +1488,16 @@ apiRouter.post('/orders', async (req: Request, res: Response) => {
 
 // The admin's Paid button: settles a table's open bill and hands the table
 // back, so the next order from it starts a fresh order id.
-apiRouter.post('/tables/:id/settle', async (req: Request, res: Response) => {
+protectedRouter.post('/tables/:id/settle', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const cafeId = req.cafeId!;
 
     const openRes = await query(
       `SELECT id FROM orders
-       WHERE table_id = $1 AND status <> 'cancelled' AND payment_status <> 'paid'
+       WHERE table_id = $1 AND cafe_id = $2 AND status <> 'cancelled' AND payment_status <> 'paid'
        ORDER BY created_at DESC LIMIT 1`,
-      [id]
+      [id, cafeId]
     );
 
     // Release the table either way. No open bill means it should not have been
@@ -1426,25 +1508,25 @@ apiRouter.post('/tables/:id/settle', async (req: Request, res: Response) => {
       // A paid bill closes the meal out: any round the kitchen never ticked
       // off is marked served here rather than left sitting on the pass.
       await query(
-        `UPDATE orders SET payment_status = 'paid', status = 'served', updated_at = now() WHERE id = $1`,
-        [orderId]
+        `UPDATE orders SET payment_status = 'paid', status = 'served', updated_at = now() WHERE id = $1 AND cafe_id = $2`,
+        [orderId, cafeId]
       );
       await query(
-        `UPDATE order_rounds SET status = 'served' WHERE order_id = $1 AND status <> 'cancelled'`,
-        [orderId]
+        `UPDATE order_rounds SET status = 'served' WHERE order_id = $1 AND cafe_id = $2 AND status <> 'cancelled'`,
+        [orderId, cafeId]
       );
     }
 
     await query(
-      `UPDATE tables SET status = 'available', active_order_id = NULL WHERE id = $1`,
-      [id]
+      `UPDATE tables SET status = 'available', active_order_id = NULL WHERE id = $1 AND cafe_id = $2`,
+      [id, cafeId]
     );
 
-    notifyResourceChanged('orders');
-    notifyResourceChanged('tables');
+    notifyResourceChanged(cafeId, 'orders');
+    notifyResourceChanged(cafeId, 'tables');
 
     const settled = openRes.rows.length > 0
-      ? await fetchFullOrders('WHERE id = $1', [openRes.rows[0].id])
+      ? await fetchFullOrders(cafeId, 'AND id = $2', [openRes.rows[0].id])
       : [];
     res.json({ settledOrder: settled[0] || null });
   } catch (err: any) {
@@ -1452,30 +1534,39 @@ apiRouter.post('/tables/:id/settle', async (req: Request, res: Response) => {
   }
 });
 
-apiRouter.patch('/orders/:id/status', async (req: Request, res: Response) => {
+protectedRouter.patch('/orders/:id/status', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const cafeId = req.cafeId!;
     const { status } = req.body;
 
     // Status only. Serving deliberately does NOT mark the bill paid: it is
     // payment_status that holds a table's tab open, so settling it here would
     // split the table's next round onto a new order id. Payment happens once,
     // through POST /tables/:id/settle.
-    await query('UPDATE orders SET status = $1, updated_at = now() WHERE id = $2', [status, id]);
+    const updatedOrder = await query(
+      'UPDATE orders SET status = $1, updated_at = now() WHERE id = $2 AND cafe_id = $3 RETURNING id',
+      [status, id, cafeId]
+    );
+    if (updatedOrder.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
 
     // Update all rounds
     if (status === 'preparing') {
       await query(
-        `UPDATE order_rounds SET status = 'preparing', preparing_started_at = COALESCE(preparing_started_at, now()) WHERE order_id = $1 AND status = 'received'`,
-        [id]
+        `UPDATE order_rounds SET status = 'preparing', preparing_started_at = COALESCE(preparing_started_at, now()) WHERE order_id = $1 AND cafe_id = $2 AND status = 'received'`,
+        [id, cafeId]
       );
     } else if (status === 'ready') {
       await query(
-        `UPDATE order_rounds SET status = 'ready', ready_at = COALESCE(ready_at, now()) WHERE order_id = $1 AND status IN ('received', 'preparing')`,
-        [id]
+        `UPDATE order_rounds SET status = 'ready', ready_at = COALESCE(ready_at, now()) WHERE order_id = $1 AND cafe_id = $2 AND status IN ('received', 'preparing')`,
+        [id, cafeId]
       );
     } else if (status === 'served' || status === 'cancelled') {
-      await query('UPDATE order_rounds SET status = $1 WHERE order_id = $2', [status, id]);
+      await query('UPDATE order_rounds SET status = $1 WHERE order_id = $2 AND cafe_id = $3', [
+        status,
+        id,
+        cafeId,
+      ]);
 
       // Serving does NOT release the table any more — the party is still
       // seated and can add to this same bill. Only POST /tables/:id/settle
@@ -1484,26 +1575,29 @@ apiRouter.patch('/orders/:id/status', async (req: Request, res: Response) => {
       // A cancelled order is the exception: there is nothing left to pay, so
       // release the table unless it still has another bill open.
       if (status === 'cancelled') {
-        const ordRes = await query('SELECT table_id FROM orders WHERE id = $1', [id]);
+        const ordRes = await query('SELECT table_id FROM orders WHERE id = $1 AND cafe_id = $2', [
+          id,
+          cafeId,
+        ]);
         if (ordRes.rows.length > 0) {
           const tableId = ordRes.rows[0].table_id;
           const otherRes = await query(
-            `SELECT count(*) FROM orders WHERE table_id = $1 AND id != $2 AND status <> 'cancelled' AND payment_status <> 'paid'`,
-            [tableId, id]
+            `SELECT count(*) FROM orders WHERE table_id = $1 AND cafe_id = $2 AND id != $3 AND status <> 'cancelled' AND payment_status <> 'paid'`,
+            [tableId, cafeId, id]
           );
           if (parseInt(otherRes.rows[0].count, 10) === 0) {
             await query(
-              `UPDATE tables SET status = 'available', active_order_id = NULL WHERE id = $1`,
-              [tableId]
+              `UPDATE tables SET status = 'available', active_order_id = NULL WHERE id = $1 AND cafe_id = $2`,
+              [tableId, cafeId]
             );
           }
         }
       }
     }
 
-    const updated = await fetchFullOrders('WHERE id = $1', [id]);
-    notifyResourceChanged('orders');
-    notifyResourceChanged('tables');
+    const updated = await fetchFullOrders(cafeId, 'AND id = $2', [id]);
+    notifyResourceChanged(cafeId, 'orders');
+    notifyResourceChanged(cafeId, 'tables');
     res.json(updated[0] || null);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1517,8 +1611,11 @@ apiRouter.patch('/orders/:id/status', async (req: Request, res: Response) => {
 // rounds all ready" — otherwise an order with 2 served rounds + 1 ready round
 // falls through every check and wrongly lands back on 'preparing', freezing
 // the badge at the wrong value forever.
-async function recomputeOrderStatus(orderId: string): Promise<string> {
-  const allRounds = await query('SELECT status FROM order_rounds WHERE order_id = $1', [orderId]);
+async function recomputeOrderStatus(orderId: string, cafeId: string): Promise<string> {
+  const allRounds = await query('SELECT status FROM order_rounds WHERE order_id = $1 AND cafe_id = $2', [
+    orderId,
+    cafeId,
+  ]);
   const statuses = allRounds.rows.map((r) => r.status);
   const activeStatuses = statuses.filter((s) => s !== 'served' && s !== 'cancelled');
 
@@ -1529,80 +1626,90 @@ async function recomputeOrderStatus(orderId: string): Promise<string> {
   else if (activeStatuses.every((s) => s === 'ready')) aggregate = 'ready';
   else if (activeStatuses.every((s) => s === 'received')) aggregate = 'received';
 
-  await query('UPDATE orders SET status = $1, updated_at = now() WHERE id = $2', [aggregate, orderId]);
+  await query('UPDATE orders SET status = $1, updated_at = now() WHERE id = $2 AND cafe_id = $3', [
+    aggregate,
+    orderId,
+    cafeId,
+  ]);
   return aggregate;
 }
 
-apiRouter.patch('/orders/:id/rounds/:roundNumber/status', async (req: Request, res: Response) => {
+protectedRouter.patch('/orders/:id/rounds/:roundNumber/status', async (req: Request, res: Response) => {
   try {
     const { id, roundNumber } = req.params;
+    const cafeId = req.cafeId!;
     const { status } = req.body;
     const rNum = parseInt(roundNumber, 10);
 
     if (status === 'preparing') {
       await query(
-        `UPDATE order_rounds SET status = $1, preparing_started_at = COALESCE(preparing_started_at, now()) WHERE order_id = $2 AND round_number = $3`,
-        [status, id, rNum]
+        `UPDATE order_rounds SET status = $1, preparing_started_at = COALESCE(preparing_started_at, now()) WHERE order_id = $2 AND cafe_id = $3 AND round_number = $4`,
+        [status, id, cafeId, rNum]
       );
     } else if (status === 'ready') {
       await query(
-        `UPDATE order_rounds SET status = $1, ready_at = COALESCE(ready_at, now()) WHERE order_id = $2 AND round_number = $3`,
-        [status, id, rNum]
+        `UPDATE order_rounds SET status = $1, ready_at = COALESCE(ready_at, now()) WHERE order_id = $2 AND cafe_id = $3 AND round_number = $4`,
+        [status, id, cafeId, rNum]
       );
     } else {
       await query(
-        `UPDATE order_rounds SET status = $1 WHERE order_id = $2 AND round_number = $3`,
-        [status, id, rNum]
+        `UPDATE order_rounds SET status = $1 WHERE order_id = $2 AND cafe_id = $3 AND round_number = $4`,
+        [status, id, cafeId, rNum]
       );
     }
 
-    const aggregate = await recomputeOrderStatus(id);
+    const aggregate = await recomputeOrderStatus(id, cafeId);
 
-    const updated = await fetchFullOrders('WHERE id = $1', [id]);
-    notifyResourceChanged('orders');
-    if (aggregate === 'served' || aggregate === 'cancelled') notifyResourceChanged('tables');
+    const updated = await fetchFullOrders(cafeId, 'AND id = $2', [id]);
+    notifyResourceChanged(cafeId, 'orders');
+    if (aggregate === 'served' || aggregate === 'cancelled') notifyResourceChanged(cafeId, 'tables');
     res.json(updated[0] || null);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-apiRouter.patch('/orders/:id/prep-time', async (req: Request, res: Response) => {
+protectedRouter.patch('/orders/:id/prep-time', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const cafeId = req.cafeId!;
     const { additionalOrTotalMinutes, isAdjustment, roundNumber } = req.body;
 
     if (roundNumber) {
       if (isAdjustment) {
         await query(
-          `UPDATE order_rounds SET estimated_prep_time_min = GREATEST(5, estimated_prep_time_min + $1) WHERE order_id = $2 AND round_number = $3`,
-          [additionalOrTotalMinutes, id, roundNumber]
+          `UPDATE order_rounds SET estimated_prep_time_min = GREATEST(5, estimated_prep_time_min + $1) WHERE order_id = $2 AND cafe_id = $3 AND round_number = $4`,
+          [additionalOrTotalMinutes, id, cafeId, roundNumber]
         );
       } else {
         await query(
-          `UPDATE order_rounds SET estimated_prep_time_min = GREATEST(5, $1) WHERE order_id = $2 AND round_number = $3`,
-          [additionalOrTotalMinutes, id, roundNumber]
+          `UPDATE order_rounds SET estimated_prep_time_min = GREATEST(5, $1) WHERE order_id = $2 AND cafe_id = $3 AND round_number = $4`,
+          [additionalOrTotalMinutes, id, cafeId, roundNumber]
         );
       }
     } else {
       // Update the active cooking round or last round
       if (isAdjustment) {
         await query(
-          `UPDATE order_rounds SET estimated_prep_time_min = GREATEST(5, estimated_prep_time_min + $1) WHERE order_id = $2 AND status = 'preparing'`,
-          [additionalOrTotalMinutes, id]
+          `UPDATE order_rounds SET estimated_prep_time_min = GREATEST(5, estimated_prep_time_min + $1) WHERE order_id = $2 AND cafe_id = $3 AND status = 'preparing'`,
+          [additionalOrTotalMinutes, id, cafeId]
         );
       } else {
         await query(
-          `UPDATE order_rounds SET estimated_prep_time_min = GREATEST(5, $1) WHERE order_id = $2 AND status = 'preparing'`,
-          [additionalOrTotalMinutes, id]
+          `UPDATE order_rounds SET estimated_prep_time_min = GREATEST(5, $1) WHERE order_id = $2 AND cafe_id = $3 AND status = 'preparing'`,
+          [additionalOrTotalMinutes, id, cafeId]
         );
       }
     }
 
-    const updated = await fetchFullOrders('WHERE id = $1', [id]);
-    notifyResourceChanged('orders');
+    const updated = await fetchFullOrders(cafeId, 'AND id = $2', [id]);
+    notifyResourceChanged(cafeId, 'orders');
     res.json(updated[0] || null);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Mounted last: only requests that didn't match any public route above fall
+// through to here, at which point a valid staff JWT is required.
+apiRouter.use(requireAuth, protectedRouter);

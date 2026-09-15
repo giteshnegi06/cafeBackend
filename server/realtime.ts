@@ -9,8 +9,6 @@
 
 import Pusher from 'pusher';
 
-const CHANNEL = 'qr-ordering';
-
 let _pusher: Pusher | null | undefined;
 
 function getPusher(): Pusher | null {
@@ -35,10 +33,10 @@ function getPusher(): Pusher | null {
 
 export type RealtimeResource = 'orders' | 'tables' | 'categories' | 'menu' | 'cafe' | 'service_requests';
 
-export function notifyResourceChanged(resource: RealtimeResource): void {
+export function notifyResourceChanged(cafeId: string, resource: RealtimeResource): void {
   const pusher = getPusher();
   if (!pusher) return;
-  pusher.trigger(CHANNEL, 'resource-updated', { resource }).catch((err) => {
+  pusher.trigger(`cafe-${cafeId}`, 'resource-updated', { resource }).catch((err) => {
     console.error('[Realtime] Failed to publish event:', err.message);
   });
 }
